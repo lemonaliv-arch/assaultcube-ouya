@@ -215,13 +215,52 @@ mode. The root cause is entirely in SDL2 2.0.14's Android text-input pipeline, n
     seconds when it does run).
   - `AssetExporter.sLastProgressMs` (a `volatile`) is bumped per file copied.
   - `LaunchActivity.startExportWatchdog()` polls that timestamp every 3 s; if it has not advanced for 12 s
-    the export is assumed wedged and the game is launched anyway. A legitimately slow-but-progressing export
+    the export is assumed wedged and we stop waiting for it. A legitimately slow-but-progressing export
     keeps bumping the timestamp, so the watchdog never misfires.
-  - `startGameSafely()` is gated by an `AtomicBoolean gameStarted` so `startGame()` runs exactly once,
+  - `startGameSafely()` is gated by an `AtomicBoolean gameStarted` so the launch path runs exactly once,
     whichever path (pipeline finally, or watchdog) gets there first.
+- **★ Verify before launch (v27 / versionCode 27):** the original error paths above ended in "launch the game
+  anyway" — but if **no complete asset export exists at all**, the native side is *guaranteed* to abort with
+  `AC FATAL: cannot find default font definitions` (`config/font.cfg` missing at `absbasedir`,
+  `main.cpp` font check). That traded an infinite splash for a **crash on every launch** on devices where
+  the export fails: storage full (`FileOutputStream` throws per file → `allWentWell=false`), external
+  storage unavailable (`getExternalFilesDir()` null), or a genuinely wedged copy. Worse, the fatal
+  `exit(1)` kills the still-running export thread, so `androidappversioncode.txt` is never written and the
+  next launch repeats the whole cycle — exactly the field reports from other OUYA users (logcat:
+  `Displayed …AssaultCubeActivity +518ms` → `AC FATAL: cannot find default font definitions` → process
+  exits 1; the earlier `EGL_BAD_DISPLAY` / "Couldn't find display mode match" lines are benign noise —
+  window and GL context were created fine). Fixes:
+  - `startGameSafely()` now calls `verifyDataAndStartGame()`: the game only starts if
+    `AssetExporter.hasCompletedExport()` (= `androidappversioncode.txt` exists — written only after a fully
+    successful export; a *stale* export from an older version is fine to run). Otherwise an
+    **"Installation failed" dialog** explains the problem (shows free space; ~60 MB needed) with
+    **Retry** (rearms both `AtomicBoolean`s and reruns the pipeline) / **Quit** buttons.
+  - `AssetExporter.copyAssets()` fails fast with a clear log when `getExternalFilesDir()` is null (before,
+    `new File(null, name)` silently degraded to relative paths and every copy failed one by one), and logs
+    the target dir + free space (`StatFs`) up front.
+  - Watchdog robustness: `sLastProgressMs` is now bumped **per 64 KB chunk** (a slow multi-MB file no longer
+    looks stalled) and **inside `recursiveList()`** (`AssetManager.list()` is O(n) per call, ~2500 calls —
+    on slow flash the listing alone could exceed 12 s before the first file ever bumped the timestamp).
+    `startExportWatchdog()` also resets the stall clock when it starts (the static initializer's timestamp
+    can be long in the past on a Retry).
+  - **★ Build-time asset index + on-screen progress:** on a stock OUYA the first launch sat on
+    "Please wait…" for *minutes at 32% CPU with zero files copied* — `AssetManager.list()` costs
+    O(total assets) **per call** on API 16, and the recursive listing makes ~1900 of them. A gradle task
+    (`generateAssetIndex`, hooked before `preBuild`, output added to `sourceSets.main.assets`) now writes
+    `assets_index.txt` (one relative path per line) at build time and `AssetExporter.listAssets()` reads it
+    with a single `open()`, falling back to the old recursion if the index is absent. And because the copy
+    itself still takes a while on slow flash, `copyAssets()` reports per-file progress through a
+    `ProgressListener`; `LaunchActivity` throttles it (≥200 ms) into the splash `TextView`:
+    `Installing game data… 43% (812/1889 files)`, plus "Updating server list…" / "Starting game…" phase
+    lines — users can see it is not frozen.
+  - Native hardening: `setupandroidbasedir()` (stream.cpp) no longer falls back to a stale hardcoded path
+    (old `net.cubers.assaultcube` package + API17-style `/storage/emulated/0`); it probes the
+    `com.ryo.assaultcubeouya` external-files candidates (`/mnt/sdcard`, `/sdcard`, `/storage/emulated/0`)
+    with `access()` and logs the resolved dir (`AC data dir:` in logcat). The font fatal now includes the
+    data dir in its message so future user crash logs are self-diagnosing.
 
 > **Dev tip:** to deploy a config-only change *without* the slow re-export, push the file to
-> `/sdcard/Android/data/net.cubers.assaultcube/files/config/` and
+> `/sdcard/Android/data/com.ryo.assaultcubeouya/files/config/` and
 > `echo <versionCode> > …/files/androidappversioncode.txt` so `isAssetExportRequired()` sees a match.
 
 ## 10. Performance pass (Tegra 3 is fillrate / bandwidth bound)
@@ -299,8 +338,9 @@ it on the device (see §9).
 - **Working (playable):** builds (debug + signed release), installs, boots → menu → loads a map → full
   single-player **and online multiplayer** gameplay with the OUYA controller (movement, look, fire, jump,
   crouch, aim, weapon switching all confirmed). gl4es→GLES2 rendering, OpenAL audio. Soft-keyboard text
-  fields validate on Enter/Back (§8); the "Please wait…" splash can no longer hang (§9); performance pass
-  renders 720p upscaled to fullscreen with the heavy passes disabled (§10).
+  fields validate on Enter/Back (§8); the "Please wait…" splash can no longer hang, and a failed asset
+  export no longer crash-loops the game — it shows an "Installation failed"/Retry dialog instead (§9, v27);
+  performance pass renders 720p upscaled to fullscreen with the heavy passes disabled (§10).
 - **MULTIPLAYER — working.** Online play against the official AssaultCube servers is functional: the
   in-game server browser is populated from a **bundled official server list** (`config/mobile_serverlist.cfg`),
   because the standard HTTPS masterserver fetch in `LaunchActivity.updateFromMasterserver` SSL-fails on this
@@ -318,9 +358,10 @@ it on the device (see §9).
   `source/android/.gitignore` (keystore excludes)
 - `source/android/app/src/main/cpp/CMakeLists.txt` (vorbisfile + hidapi imports/links)
 - `source/android/app/src/main/java/net/cubers/assaultcube/LaunchActivity.java` (fromHtml guard, UTF-8,
-  timeouts, run-once guard, try/finally, **stall watchdog**)
+  timeouts, run-once guard, try/finally, **stall watchdog**, **verify-before-launch + Retry dialog**)
 - `source/android/app/src/main/java/net/cubers/assaultcube/AssetExporter.java` (64 KB copy buffer,
-  `sLastProgressMs` progress signal)
+  `sLastProgressMs` progress signal — per-chunk + during listing, null-storage fail-fast,
+  `hasCompletedExport`/`getFreeSpaceMb` helpers)
 - `source/android/app/src/main/java/net/cubers/assaultcube/AssaultCubeActivity.java` (`getLibraries()` order)
 - `source/android/app/src/main/java/org/libsdl/app/SDLActivity.java` (**`sRenderMaxHeight` downscale** in
   `surfaceChanged`, **`MATCH_PARENT` surface layout** for fullscreen)

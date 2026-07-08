@@ -44,10 +44,19 @@ public class LaunchActivity extends Activity {
     // Guarantees startGame() runs exactly once, whether it comes from the pipeline finishing or the watchdog.
     private final AtomicBoolean gameStarted = new AtomicBoolean(false);
 
+    private TextView statusText;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_launch);
+        statusText = (TextView) findViewById(R.id.tvLoading);
+    }
+
+    /** Update the splash status line from any thread - the first install takes a while on the OUYA's slow
+     *  flash, and without visible progress users assume the game froze on "Please wait...". */
+    private void setStatus(final String text) {
+        runOnUiThread(() -> statusText.setText(text));
     }
 
     @Override
@@ -103,15 +112,18 @@ public class LaunchActivity extends Activity {
                 Log.i("launch", "termsAccepted: exporting assets...");
                 exportAssets();
                 Log.i("launch", "assets exported; updating from masterserver...");
+                setStatus("Updating server list…");
                 updateFromMasterserver();
                 Log.i("launch", "masterserver step done; starting game.");
+                setStatus("Starting game…");
             } catch (Throwable t) {
                 // Never let a failing startup step strand the user on "Please wait..." forever. Any
                 // uncaught exception/Error here (e.g. getExternalFilesDir() momentarily null, an
                 // unexpected IO/runtime error in asset export, OOM) would otherwise skip the
-                // startGame() call below and freeze the splash. Log it and launch anyway - the game
-                // can run with stale/partial data and surfaces its own errors in-engine.
-                Log.e("launch", "startup step failed; launching game anyway.", t);
+                // startGameSafely() call below and freeze the splash. Log it and hand off to
+                // startGameSafely(), which starts the game only if a complete export exists (stale
+                // data is fine) and otherwise shows the installation-failed dialog.
+                Log.e("launch", "startup step failed.", t);
             } finally {
                 startGameSafely();
             }
@@ -124,7 +136,48 @@ public class LaunchActivity extends Activity {
      */
     private void startGameSafely() {
         if(!gameStarted.compareAndSet(false, true)) return;
-        new Handler(Looper.getMainLooper()).post(this::startGame);
+        new Handler(Looper.getMainLooper()).post(this::verifyDataAndStartGame);
+    }
+
+    /**
+     * Only actually start the game if a complete asset export exists (this run's, or a stale one from an
+     * older version - both are fine). Launching WITHOUT one used to be the "launch anyway" fallback of the
+     * pipeline/watchdog error paths, but the native side is then GUARANTEED to abort with
+     * 'AC FATAL: cannot find default font definitions' - i.e. we traded an infinite splash for a crash on
+     * devices where the export fails (storage full, external storage unavailable, wedged I/O). Users on
+     * such devices crashed on EVERY launch: the fatal exit also kills the still-running export thread, so
+     * the version file is never written and the next launch repeats the whole cycle. Instead: explain the
+     * problem and offer a retry.
+     */
+    private void verifyDataAndStartGame() {
+        if(AssetExporter.hasCompletedExport(this)) {
+            startGame();
+            return;
+        }
+        long freeMb = AssetExporter.getFreeSpaceMb(this);
+        Log.e("launch", "no complete asset export present; not starting the game (free space: " + freeMb + " MB).");
+        String msg = "The game data could not be installed"
+                + (freeMb < 0 ? " (external storage unavailable)."
+                              : " (free space: " + freeMb + " MB; about 60 MB are needed).")
+                + "\n\nIf storage is full, free up some space, then press Retry.";
+        AlertDialog.Builder builder = new AlertDialog.Builder(this, R.style.AcAlertDialogTheme);
+        builder.setTitle("Installation failed");
+        builder.setMessage(msg);
+        builder.setCancelable(false);
+        builder.setPositiveButton("Retry", (dialog, id) -> {
+            dialog.cancel();
+            // Rearm both guards and rerun the whole startup pipeline (terms are already accepted).
+            // If a previous export thread is still wedged in the background it may briefly overlap the
+            // new one; both copy identical content, so that is harmless.
+            gameStarted.set(false);
+            startupBegun.set(false);
+            termsAccepted();
+        });
+        builder.setNegativeButton("Quit", (dialog, id) -> {
+            dialog.cancel();
+            finish();
+        });
+        builder.create().show();
     }
 
     /**
@@ -136,14 +189,18 @@ public class LaunchActivity extends Activity {
      */
     private void startExportWatchdog() {
         final Handler h = new Handler(Looper.getMainLooper());
-        final long STALL_MS = 12000;   // a single file copy should never take this long
+        final long STALL_MS = 12000;   // progress is bumped per copied CHUNK (64KB), so 12s of silence means truly wedged
         final long POLL_MS = 3000;
+        // Start the stall clock NOW: the static initializer's timestamp may be long in the past (class
+        // loaded earlier; or this is a Retry after a failed export) and the watchdog would otherwise
+        // consider the export stalled on its very first poll, racing the fresh pipeline.
+        AssetExporter.sLastProgressMs = android.os.SystemClock.elapsedRealtime();
         h.postDelayed(new Runnable() {
             @Override public void run() {
                 if(gameStarted.get()) return; // already on our way into the game
                 long stalledFor = android.os.SystemClock.elapsedRealtime() - AssetExporter.sLastProgressMs;
                 if(stalledFor > STALL_MS) {
-                    Log.e("launch", "asset export made no progress for " + stalledFor + "ms; assuming it is wedged and launching the game anyway.");
+                    Log.e("launch", "asset export made no progress for " + stalledFor + "ms; assuming it is wedged and giving up waiting.");
                     startGameSafely();
                     return;
                 }
@@ -166,7 +223,17 @@ public class LaunchActivity extends Activity {
         AssetExporter assetExporter = new AssetExporter();
         boolean copyAssetsRequired = assetExporter.isAssetExportRequired(LaunchActivity.this);
         if(copyAssetsRequired) {
-            boolean assetsExported = assetExporter.copyAssets(LaunchActivity.this);
+            setStatus("Installing game data…");
+            boolean assetsExported = assetExporter.copyAssets(LaunchActivity.this, new AssetExporter.ProgressListener() {
+                private long lastUiUpdateMs = 0;
+                @Override public void onProgress(int copied, int total) {
+                    // Called per copied file from the export thread; throttle the UI churn.
+                    long now = android.os.SystemClock.elapsedRealtime();
+                    if(now - lastUiUpdateMs < 200 && copied != total) return;
+                    lastUiUpdateMs = now;
+                    setStatus("Installing game data… " + (copied * 100 / total) + "% (" + copied + "/" + total + " files)");
+                }
+            });
             if( !assetsExported ) {
                 // todo make user aware of the failure.
                 //  fs: AlertDialog does not work at this stage (see updateFromMasterserver() comments too)

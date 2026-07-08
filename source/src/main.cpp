@@ -1550,7 +1550,10 @@ int main(int argc, char **argv)
     updateigraphs();
     autostartscripts("_veryfirst_");
     // Main font file, all other font files execute from here.
-    if(!execfile("config/font.cfg")) fatal("cannot find default font definitions");
+    // If this fails the game data is missing at the resolved base dir (on Android: the asset
+    // export never completed) - include the dir in the message so user crash logs are diagnostic.
+    extern const char *absbasedir;
+    if(!execfile("config/font.cfg")) fatal("cannot find default font definitions (data dir: %s)", absbasedir ? absbasedir : "<none>");
     // Check these 2 standard fonts have been executed.
     if(!setfont("mono")) fatal("no mono font specified");
     if(!setfont("default")) fatal("no default font specified");

@@ -22,6 +22,8 @@ vector<char *> packagedirs;
 const char *absbasedir = NULL;
 
 #if defined(__ANDROID__) && !defined(STANDALONE)
+#include <unistd.h>
+#include <android/log.h>
 void setupandroidbasedir()
 {
     static string androidbasedir;
@@ -31,7 +33,27 @@ void setupandroidbasedir()
         formatstring(androidbasedir)("%s/", ext);
         absbasedir = androidbasedir;
     }
-    else absbasedir = "/storage/emulated/0/Android/data/net.cubers.assaultcube/files/";
+    else
+    {
+        // SDL couldn't resolve getExternalFilesDir() (storage unmounted/unavailable at launch).
+        // Probe the known app-external-files locations for this applicationId; keep the last
+        // candidate even if the probe fails so absbasedir is never NULL.
+        static const char * const candidates[] = {
+            "/mnt/sdcard/Android/data/com.ryo.assaultcubeouya/files/",          // OUYA (API16)
+            "/sdcard/Android/data/com.ryo.assaultcubeouya/files/",
+            "/storage/emulated/0/Android/data/com.ryo.assaultcubeouya/files/",  // API17+
+        };
+        absbasedir = candidates[sizeof(candidates)/sizeof(candidates[0]) - 1];
+        loopi(sizeof(candidates)/sizeof(candidates[0])) if(access(candidates[i], R_OK) == 0)
+        {
+            absbasedir = candidates[i];
+            break;
+        }
+        __android_log_print(ANDROID_LOG_ERROR, "SDL/APP",
+            "AC setupandroidbasedir: SDL_AndroidGetExternalStoragePath failed (%s); falling back to %s",
+            SDL_GetError(), absbasedir);
+    }
+    __android_log_print(ANDROID_LOG_INFO, "SDL/APP", "AC data dir: %s", absbasedir);
 }
 #else
 void setupandroidbasedir() {}
