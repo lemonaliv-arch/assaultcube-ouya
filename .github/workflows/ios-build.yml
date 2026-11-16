@@ -1,4 +1,4 @@
-name: iOS device build
+name: iOS device bootstrap build
 
 on:
   workflow_dispatch:
@@ -7,73 +7,73 @@ on:
   pull_request:
 
 jobs:
-  arm64-device-build:
+  bootstrap-arm64:
     runs-on: xcode-27
-    timeout-minutes: 90
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify toolchain
+      - name: Verify Xcode and iOS SDK
         shell: bash
         run: |
           xcode-select -p
           xcodebuild -version
-          xcodebuild -showsdks
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphoneos --show-sdk-path
 
-      - name: Install build tools
+      - name: Install CMake and Ninja
         shell: bash
         run: |
           brew install cmake ninja
           cmake --version
           ninja --version
 
-      - name: Configure iOS arm64 build
+      - name: Configure device-only ARM64 bootstrap app
         shell: bash
         run: |
-          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          cmake -S ios -B ios/build \
-            -G Ninja \
+          IOS_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          cmake -S ios -B ios/build -G Ninja \
             -DCMAKE_SYSTEM_NAME=iOS \
-            -DCMAKE_OSX_SYSROOT="${SDK}" \
+            -DCMAKE_OSX_SYSROOT="$IOS_SDK" \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
-            -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
-            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
-            -DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM=""
+            -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build app bundle
+      - name: Build
+        shell: bash
+        run: cmake --build ios/build --config Release --parallel
+
+      - name: Verify app bundle and executable architecture
         shell: bash
         run: |
-          cmake --build ios/build --config Release --parallel
-
-      - name: Sanity-check device binary
-        shell: bash
-        run: |
-          find ios/build -maxdepth 3 -type f \( -name '*.app' -o -name '*AssaultCube*' -o -name '*.plist' \) | sort
-          APP="ios/build/AssaultCubeIOSBootstrap.app/AssaultCubeIOSBootstrap"
-          if [ -f "$APP" ]; then
-            file "$APP"
-            lipo -info "$APP"
-            otool -hv "$APP" | head
-          else
-            echo "App binary not created: $APP"
+          APP="ios/build/AssaultCubeIOSBootstrap.app"
+          EXECUTABLE="$APP/AssaultCubeIOSBootstrap"
+          test -d "$APP"
+          test -f "$APP/Info.plist"
+          test -x "$EXECUTABLE"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
+          file "$EXECUTABLE"
+          lipo -verify_arch arm64 "$EXECUTABLE"
+          if otool -L "$EXECUTABLE" | grep -E 'lib(main|SDL2|GL)\.so|libandroid'; then
+            echo 'Unexpected Android library dependency found' >&2
             exit 1
           fi
 
-      - name: Package unsigned IPA
+      - name: Package unsigned bootstrap IPA
         shell: bash
         run: |
-          rm -rf Payload
-          mkdir -p Payload
-          cp -R ios/build/AssaultCubeIOSBootstrap.app Payload/
-          zip -qr AssaultCubeIOSBootstrap_unsigned.ipa Payload
-          ls -lh AssaultCubeIOSBootstrap_unsigned.ipa
+          rm -rf Payload AssaultCubeIOSBootstrap_unsigned.ipa
+          mkdir Payload
+          ditto ios/build/AssaultCubeIOSBootstrap.app Payload/AssaultCubeIOSBootstrap.app
+          (cd Payload && zip -qry ../AssaultCubeIOSBootstrap_unsigned.ipa AssaultCubeIOSBootstrap.app)
+          unzip -l AssaultCubeIOSBootstrap_unsigned.ipa | grep 'Payload/AssaultCubeIOSBootstrap.app/Info.plist'
 
-      - name: Upload artifact
+      - name: Upload unsigned bootstrap IPA
         uses: actions/upload-artifact@v4
         with:
-          name: assaultcube-ios-bootstrap-ipa
-          path: ./AssaultCubeIOSBootstrap_unsigned.ipa
+          name: assaultcube-ios-bootstrap-unsigned-ipa
+          path: AssaultCubeIOSBootstrap_unsigned.ipa
           if-no-files-found: error
