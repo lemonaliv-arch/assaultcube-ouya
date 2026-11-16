@@ -1,4 +1,3 @@
-# AssaultCube iOS bootstrap scaffold workflow
 name: iOS device build
 
 on:
