@@ -10,6 +10,7 @@ set(CMAKE_OSX_DEPLOYMENT_TARGET "17.0" CACHE STRING "Minimum iOS version")
 set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "Device architecture")
 
 find_library(UIKIT_FRAMEWORK UIKit REQUIRED)
+find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
 
 configure_file(
   "${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in"
@@ -18,7 +19,10 @@ configure_file(
 )
 
 add_executable(AssaultCubeIOSBootstrap MACOSX_BUNDLE main.m)
-target_link_libraries(AssaultCubeIOSBootstrap PRIVATE "${UIKIT_FRAMEWORK}")
+target_link_libraries(AssaultCubeIOSBootstrap PRIVATE
+  "${UIKIT_FRAMEWORK}"
+  "${FOUNDATION_FRAMEWORK}"
+)
 target_compile_options(AssaultCubeIOSBootstrap PRIVATE -fobjc-arc)
 
 set_target_properties(AssaultCubeIOSBootstrap PROPERTIES
