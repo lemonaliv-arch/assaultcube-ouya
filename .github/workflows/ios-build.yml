@@ -66,9 +66,9 @@ jobs:
         shell: bash
         run: |
           rm -rf Payload AssaultCubeIOSBootstrap_unsigned.ipa
-          mkdir Payload
+          mkdir -p Payload
           ditto ios/build/AssaultCubeIOSBootstrap.app Payload/AssaultCubeIOSBootstrap.app
-          (cd Payload && zip -qry ../AssaultCubeIOSBootstrap_unsigned.ipa AssaultCubeIOSBootstrap.app)
+          zip -qry AssaultCubeIOSBootstrap_unsigned.ipa Payload
           unzip -l AssaultCubeIOSBootstrap_unsigned.ipa | grep 'Payload/AssaultCubeIOSBootstrap.app/Info.plist'
 
       - name: Upload unsigned bootstrap IPA
