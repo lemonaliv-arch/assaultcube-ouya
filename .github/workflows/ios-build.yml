@@ -1,1 +1,80 @@
+# AssaultCube iOS bootstrap scaffold workflow
+name: iOS device build
 
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "ios/assaultcube-port" ]
+  pull_request:
+
+jobs:
+  arm64-device-build:
+    runs-on: xcode-27
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify toolchain
+        shell: bash
+        run: |
+          xcode-select -p
+          xcodebuild -version
+          xcodebuild -showsdks
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          brew install cmake ninja
+          cmake --version
+          ninja --version
+
+      - name: Configure iOS arm64 build
+        shell: bash
+        run: |
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          cmake -S ios -B ios/build \
+            -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT="${SDK}" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
+            -DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM=""
+
+      - name: Build app bundle
+        shell: bash
+        run: |
+          cmake --build ios/build --config Release --parallel
+
+      - name: Sanity-check device binary
+        shell: bash
+        run: |
+          find ios/build -maxdepth 3 -type f \( -name '*.app' -o -name '*AssaultCube*' -o -name '*.plist' \) | sort
+          APP="ios/build/AssaultCubeIOSBootstrap.app/AssaultCubeIOSBootstrap"
+          if [ -f "$APP" ]; then
+            file "$APP"
+            lipo -info "$APP"
+            otool -hv "$APP" | head
+          else
+            echo "App binary not created: $APP"
+            exit 1
+          fi
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R ios/build/AssaultCubeIOSBootstrap.app Payload/
+          zip -qr AssaultCubeIOSBootstrap_unsigned.ipa Payload
+          ls -lh AssaultCubeIOSBootstrap_unsigned.ipa
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: assaultcube-ios-bootstrap-ipa
+          path: ./AssaultCubeIOSBootstrap_unsigned.ipa
+          if-no-files-found: error
